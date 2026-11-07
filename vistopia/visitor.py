@@ -1,5 +1,5 @@
 import requests
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 from urllib.request import urlretrieve, urlcleanup
 from logging import getLogger
 from functools import lru_cache
@@ -24,6 +24,20 @@ logger = getLogger(__name__)
 class Visitor:
     def __init__(self, token: Optional[str]):
         self.token = token
+
+    def authorized_url(self, url: Optional[str]) -> Optional[str]:
+        """Attach the API token to a web URL.
+
+        Article pages live on the same API host as the JSON endpoints.  An
+        anonymous request is served a truncated article, so the token has to
+        travel with the transcript URL as well.
+        """
+        if not url or not self.token:
+            return url
+        separator = "&" if "?" in url else "?"
+        return "{}{}api_token={}".format(
+            url, separator, quote(str(self.token), safe="")
+        )
 
     def get_api_response(self, uri: str, params: Optional[dict] = None):
 
@@ -119,7 +133,10 @@ class Visitor:
                     sanitize_filename(article.title)
                 )
                 if not fname.exists():
-                    urlretrieve(article.content_url, fname)
+                    url = self.authorized_url(article.content_url)
+                    if not url:
+                        continue
+                    urlretrieve(url, fname)
 
                     with open(fname) as f:
                         content = f.read()

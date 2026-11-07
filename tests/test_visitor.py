@@ -85,3 +85,26 @@ def test_search(visitor: Visitor, keyword: str, expected: tuple):
             item.data_type,
         ) == expected for item in data
     ])
+
+
+def test_authorized_url_attaches_token():
+    visitor = Visitor(token="token-123")
+
+    assert (
+        visitor.authorized_url("https://api.vistopia.com.cn/article/1")
+        == "https://api.vistopia.com.cn/article/1?api_token=token-123"
+    )
+    assert (
+        visitor.authorized_url("https://api.vistopia.com.cn/article/1?from=web")
+        == "https://api.vistopia.com.cn/article/1?from=web&api_token=token-123"
+    )
+
+
+def test_authorized_url_without_token_is_unchanged():
+    visitor = Visitor(token=None)
+
+    assert (
+        visitor.authorized_url("https://api.vistopia.com.cn/article/1")
+        == "https://api.vistopia.com.cn/article/1"
+    )
+    assert visitor.authorized_url(None) is None
