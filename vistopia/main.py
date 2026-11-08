@@ -38,7 +38,7 @@ def main(ctx: click.Context, **argv):
 
     token = environ.get("VISTOPIA_API_TOKEN", None)
     token = argv.get("token", None) or token
-    logger.debug(f"API token `{token}` received.")
+    logger.debug("API token configured: %s", bool(token))
 
     ctx.obj = Context()
     ctx.obj.visitor = Visitor(token=token)
