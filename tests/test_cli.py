@@ -39,6 +39,7 @@ def test_cli_version(
     assert result.exit_code == 0
     assert len(result.stdout.strip().split(".")) == 3
 
+
 def test_token_is_redacted_from_logs():
     import logging
 
@@ -57,3 +58,17 @@ def test_token_is_redacted_from_logs():
     assert _TokenRedactionFilter().filter(record) is True
     assert "SECRET" not in record.getMessage()
     assert "api_token=***" in record.getMessage()
+
+
+def test_cli_redacts_token_from_debug_logs(cli_runner, caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+
+    cli_runner.invoke(main, ["-t", "SECRET-TOKEN", "-v", "DEBUG", "search"])
+    logging.getLogger("urllib3.connectionpool").debug(
+        "GET /probe?api_token=SECRET-TOKEN&x=1 HTTP/1.1"
+    )
+
+    assert "SECRET-TOKEN" not in caplog.text
+    assert "api_token=***" in caplog.text

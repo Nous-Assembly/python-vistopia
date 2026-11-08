@@ -94,7 +94,13 @@ class Visitor:
 
         logger.debug(f"Visiting {url}")
 
-        response = requests.get(url, params=params).json()
+        try:
+            response = requests.get(url, params=params).json()
+        except (requests.RequestException, ValueError):
+            # The request URL carries the token; never surface the original
+            # exception, whose text may contain it.
+            raise RuntimeError("the Vistopia API request failed") from None
+
         assert response["status"] == "success"
         assert "data" in response.keys()
 

@@ -114,9 +114,9 @@ def _catalog(title="测试节目", article=None):
     )
 
 
-def _article_url(visitor):
+def _article_url(visitor, url=None):
     return visitor.authorized_url(
-        "https://api.vistopia.com.cn/api/v1/web/article-content/abc"
+        url or "https://api.vistopia.com.cn/api/v1/web/article-content/abc"
     )
 
 
@@ -161,7 +161,12 @@ def test_authorized_url_replaces_existing_token():
 def test_authorized_url_keeps_fragment_out_of_the_token():
     from urllib.parse import urlsplit
 
-    parts = urlsplit(_article_url(Visitor("token-123")) + "#part")
+    parts = urlsplit(
+        _article_url(
+            Visitor("token-123"),
+            "https://api.vistopia.com.cn/article#part",
+        )
+    )
 
     assert parts.fragment == "part"
     assert "token-123" in parts.query
@@ -373,3 +378,19 @@ def test_save_transcript_refetches_login_page(monkeypatch, tmpdir):
     )
 
     assert 'is_cut_str = "0"' in path.read_text(encoding="utf-8")
+
+
+def test_get_api_response_hides_token_on_network_error(monkeypatch):
+    import vistopia.visitor as visitor_module
+
+    def boom(*args, **kwargs):
+        raise visitor_module.requests.ConnectionError(
+            "Max retries exceeded with url: /api?api_token=SECRET"
+        )
+
+    monkeypatch.setattr(visitor_module.requests, "get", boom)
+
+    with pytest.raises(RuntimeError) as error:
+        Visitor("SECRET").get_api_response("search/web")
+
+    assert "SECRET" not in str(error.value)
