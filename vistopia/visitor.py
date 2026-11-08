@@ -27,6 +27,9 @@ logger = getLogger(__name__)
 # Article pages are served by the API host only.
 ARTICLE_HOST = "api.vistopia.com.cn"
 
+# The article page states whether it is complete (0) or cut (1).
+CUT_MARKER = re.compile(r"""is_cut_str\s*=\s*['"](\d)['"]""")
+
 
 class Visitor:
     def __init__(self, token: Optional[str]):
@@ -41,14 +44,28 @@ class Visitor:
         another host, and the URL is rebuilt through urlsplit so a fragment
         or an existing query cannot swallow or duplicate the credential.
         """
-        if not url or not self.token:
+        if not url:
             return url
 
-        parts = urlsplit(url)
-        if parts.scheme != "https" or parts.hostname != ARTICLE_HOST:
+        try:
+            parts = urlsplit(url)
+            port = parts.port
+        except ValueError:
             raise ValueError(
-                "refusing to attach credentials to an unexpected article URL"
+                "refusing to use an unexpected article URL"
+            ) from None
+
+        if (
+            parts.scheme != "https"
+            or parts.hostname != ARTICLE_HOST
+            or port not in (None, 443)
+        ):
+            raise ValueError(
+                "refusing to use an unexpected article URL"
             )
+
+        if not self.token:
+            return url
 
         query = [
             (key, value)
@@ -159,18 +176,23 @@ class Visitor:
                 fname = show_dir / "{}.html".format(
                     sanitize_filename(article.title)
                 )
-                if fname.exists() and not self._is_cut_transcript(fname):
+                if fname.exists() and self._is_complete_transcript(fname):
                     continue
                 self._download_transcript(article, fname)
 
     @staticmethod
-    def _is_cut_transcript(path) -> bool:
-        """Return True when a saved article is the truncated preview."""
+    def _is_complete_transcript(path) -> bool:
+        """Return True only when a saved article is complete.
+
+        A file without the marker is treated as incomplete, so an empty or
+        half-written file left by an older version is fetched again.
+        """
         try:
             with open(path, encoding="utf-8", errors="replace") as handle:
-                return bool(re.search(r'is_cut_str\s*=\s*"1"', handle.read()))
+                match = CUT_MARKER.search(handle.read())
         except OSError:
             return False
+        return match is not None and match.group(1) == "0"
 
     def _download_transcript(self, article, fname):
         """Fetch one article into a temporary file, then move it into place."""
@@ -198,7 +220,15 @@ class Visitor:
             with open(temporary, encoding="utf-8", errors="replace") as handle:
                 content = handle.read()
 
-            if re.search(r'is_cut_str\s*=\s*"1"', content):
+            match = CUT_MARKER.search(content)
+            if match is None:
+                raise RuntimeError(
+                    "the server did not return a complete article for {}; "
+                    "check that the token can access this show".format(
+                        article.title
+                    )
+                )
+            if match.group(1) != "0":
                 raise RuntimeError(
                     "the server returned a truncated article for {}; "
                     "check that the token can access this show".format(

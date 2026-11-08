@@ -150,7 +150,9 @@ def test_authorized_url_replaces_existing_token():
     from urllib.parse import parse_qs, urlsplit
 
     url = "https://api.vistopia.com.cn/a?api_token=old&x=1"
-    query = parse_qs(urlsplit(Visitor("new").authorized_url(url)).query)
+    authorized = Visitor("new").authorized_url(url)
+    assert authorized is not None
+    query = parse_qs(urlsplit(authorized).query)
 
     assert query["api_token"] == ["new"]
     assert query["x"] == ["1"]
@@ -297,3 +299,77 @@ def test_save_transcript_reports_missing_url(monkeypatch, tmpdir):
             visitor.save_transcript(1)
     finally:
         os.chdir(cwd)
+
+
+def test_authorized_url_rejects_non_default_port():
+    with pytest.raises(ValueError):
+        Visitor("token-123").authorized_url(
+            "https://api.vistopia.com.cn:8443/article"
+        )
+
+
+@pytest.mark.parametrize("token", [None, ""])
+def test_authorized_url_validates_without_token(token):
+    with pytest.raises(ValueError):
+        Visitor(token=token).authorized_url("file:///etc/hosts")
+    with pytest.raises(ValueError):
+        Visitor(token=token).authorized_url(
+            "https://api.vistopia.com.cn:8443/article"
+        )
+
+
+def _save_with(monkeypatch, tmpdir, body, existing=None, token="secret"):
+    import vistopia.visitor as visitor_module
+
+    visitor = Visitor(token=token)
+    show_dir = Path(tmpdir) / "测试节目"
+    show_dir.mkdir(exist_ok=True)
+    if existing is not None:
+        (show_dir / "第一集.html").write_text(existing, encoding="utf-8")
+
+    def fake_retrieve(url, path):
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(body)
+
+    monkeypatch.setattr(visitor, "get_catalog", lambda _id: _catalog())
+    monkeypatch.setattr(visitor_module, "urlretrieve", fake_retrieve)
+
+    cwd = os.getcwd()
+    os.chdir(tmpdir)
+    try:
+        visitor.save_transcript(1)
+    finally:
+        os.chdir(cwd)
+    return show_dir / "第一集.html"
+
+
+def test_save_transcript_rejects_unmarked_response(monkeypatch, tmpdir):
+    with pytest.raises(RuntimeError):
+        _save_with(monkeypatch, tmpdir, "<html>Please log in</html>")
+
+    assert not (Path(tmpdir) / "测试节目" / "第一集.html").exists()
+
+
+def test_save_transcript_rejects_empty_response(monkeypatch, tmpdir):
+    with pytest.raises(RuntimeError):
+        _save_with(monkeypatch, tmpdir, "")
+
+    assert not (Path(tmpdir) / "测试节目" / "第一集.html").exists()
+
+
+def test_save_transcript_refetches_empty_existing_file(monkeypatch, tmpdir):
+    path = _save_with(
+        monkeypatch, tmpdir, '<html>is_cut_str = "0"; body</html>',
+        existing="",
+    )
+
+    assert 'is_cut_str = "0"' in path.read_text(encoding="utf-8")
+
+
+def test_save_transcript_refetches_login_page(monkeypatch, tmpdir):
+    path = _save_with(
+        monkeypatch, tmpdir, '<html>is_cut_str = "0"; body</html>',
+        existing="<html>Please log in</html>",
+    )
+
+    assert 'is_cut_str = "0"' in path.read_text(encoding="utf-8")
