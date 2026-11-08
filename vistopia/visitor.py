@@ -1,5 +1,9 @@
+import os
+import re
+import tempfile
+
 import requests
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import urlretrieve, urlcleanup
 from logging import getLogger
 from functools import lru_cache
@@ -20,10 +24,64 @@ from .models import (
 
 logger = getLogger(__name__)
 
+# Article pages are served by the API host only.
+ARTICLE_HOST = "api.vistopia.com.cn"
+
+# The article page states whether it is complete (0) or cut (1).
+CUT_MARKER = re.compile(r"""is_cut_str\s*=\s*['"](\d)['"]""")
+
 
 class Visitor:
     def __init__(self, token: Optional[str]):
         self.token = token
+
+    def authorized_url(self, url: Optional[str]) -> Optional[str]:
+        """Attach the API token to an article URL.
+
+        Article pages live on the same API host as the JSON endpoints.  An
+        anonymous request is served a truncated article, so the token has to
+        travel with the transcript URL as well.  The token is never sent to
+        another host, and the URL is rebuilt through urlsplit so a fragment
+        or an existing query cannot swallow or duplicate the credential.
+        """
+        if not url:
+            return url
+
+        try:
+            parts = urlsplit(url)
+            port = parts.port
+        except ValueError:
+            raise ValueError(
+                "refusing to use an unexpected article URL"
+            ) from None
+
+        if (
+            parts.scheme != "https"
+            or parts.hostname != ARTICLE_HOST
+            or port not in (None, 443)
+        ):
+            raise ValueError(
+                "refusing to use an unexpected article URL"
+            )
+
+        if not self.token:
+            return url
+
+        query = [
+            (key, value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key != "api_token"
+        ]
+        query.append(("api_token", str(self.token)))
+        return urlunsplit(
+            (
+                parts.scheme,
+                parts.netloc,
+                parts.path,
+                urlencode(query),
+                parts.fragment,
+            )
+        )
 
     def get_api_response(self, uri: str, params: Optional[dict] = None):
 
@@ -36,7 +94,13 @@ class Visitor:
 
         logger.debug(f"Visiting {url}")
 
-        response = requests.get(url, params=params).json()
+        try:
+            response = requests.get(url, params=params).json()
+        except (requests.RequestException, ValueError):
+            # The request URL carries the token; never surface the original
+            # exception, whose text may contain it.
+            raise RuntimeError("the Vistopia API request failed") from None
+
         assert response["status"] == "success"
         assert "data" in response.keys()
 
@@ -118,19 +182,78 @@ class Visitor:
                 fname = show_dir / "{}.html".format(
                     sanitize_filename(article.title)
                 )
-                if not fname.exists():
-                    urlretrieve(article.content_url, fname)
+                if fname.exists() and self._is_complete_transcript(fname):
+                    continue
+                self._download_transcript(article, fname)
 
-                    with open(fname) as f:
-                        content = f.read()
+    @staticmethod
+    def _is_complete_transcript(path) -> bool:
+        """Return True only when a saved article is complete.
 
-                    content = content.replace(
-                        "/assets/article/course.css",
-                        "https://api.vistopia.com.cn/assets/article/course.css"
+        A file without the marker is treated as incomplete, so an empty or
+        half-written file left by an older version is fetched again.
+        """
+        try:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                match = CUT_MARKER.search(handle.read())
+        except OSError:
+            return False
+        return match is not None and match.group(1) == "0"
+
+    def _download_transcript(self, article, fname):
+        """Fetch one article into a temporary file, then move it into place."""
+        url = self.authorized_url(article.content_url)
+        if not url:
+            raise RuntimeError(
+                "article URL is missing for {}".format(article.title)
+            )
+
+        descriptor, temporary = tempfile.mkstemp(
+            dir=os.path.dirname(str(fname)) or ".", suffix=".part"
+        )
+        os.close(descriptor)
+        try:
+            try:
+                urlretrieve(url, temporary)
+            except Exception:
+                # Never surface the request URL: it carries the API token.
+                raise RuntimeError(
+                    "failed to download the article for {}".format(
+                        article.title
                     )
+                ) from None
 
-                    with open(fname, "w") as f:
-                        f.write(content)
+            with open(temporary, encoding="utf-8", errors="replace") as handle:
+                content = handle.read()
+
+            match = CUT_MARKER.search(content)
+            if match is None:
+                raise RuntimeError(
+                    "the server did not return a complete article for {}; "
+                    "check that the token can access this show".format(
+                        article.title
+                    )
+                )
+            if match.group(1) != "0":
+                raise RuntimeError(
+                    "the server returned a truncated article for {}; "
+                    "check that the token can access this show".format(
+                        article.title
+                    )
+                )
+
+            content = content.replace(
+                "/assets/article/course.css",
+                "https://api.vistopia.com.cn/assets/article/course.css"
+            )
+
+            with open(temporary, "w", encoding="utf-8") as handle:
+                handle.write(content)
+
+            os.replace(temporary, str(fname))
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     def save_transcript_with_single_file(self, id: int,
                                          episodes: Optional[set] = None,

@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from logging import getLogger
 from typing import Optional
 
@@ -13,6 +14,20 @@ from .__version__ import __version__
 from .models import dump_model
 
 logger = getLogger(__name__)
+
+
+class _TokenRedactionFilter(logging.Filter):
+    """Redact api_token values before a record reaches any handler."""
+
+    _PATTERN = re.compile(r"(api_token=)[^&\s'\"<>]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        redacted = self._PATTERN.sub(r"\1***", message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
+        return True
 
 
 class Context:
@@ -36,9 +51,13 @@ def main(ctx: click.Context, **argv):
     verbosity = argv.pop("verbosity").upper()
     logging.basicConfig(format="%(asctime)s %(message)s", level=verbosity)
 
+    redaction = _TokenRedactionFilter()
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(redaction)
+
     token = environ.get("VISTOPIA_API_TOKEN", None)
     token = argv.get("token", None) or token
-    logger.debug(f"API token `{token}` received.")
+    logger.debug("API token configured: %s", bool(token))
 
     ctx.obj = Context()
     ctx.obj.visitor = Visitor(token=token)
