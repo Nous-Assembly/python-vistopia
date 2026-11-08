@@ -38,3 +38,22 @@ def test_cli_version(
 
     assert result.exit_code == 0
     assert len(result.stdout.strip().split(".")) == 3
+
+def test_token_is_redacted_from_logs():
+    import logging
+
+    from vistopia.main import _TokenRedactionFilter
+
+    record = logging.LogRecord(
+        "urllib3.connectionpool",
+        logging.DEBUG,
+        __file__,
+        1,
+        "GET /probe?api_token=SECRET&x=1 HTTP/1.1",
+        (),
+        None,
+    )
+
+    assert _TokenRedactionFilter().filter(record) is True
+    assert "SECRET" not in record.getMessage()
+    assert "api_token=***" in record.getMessage()
