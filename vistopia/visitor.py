@@ -1,5 +1,9 @@
+import os
+import re
+import tempfile
+
 import requests
-from urllib.parse import quote, urljoin
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import urlretrieve, urlcleanup
 from logging import getLogger
 from functools import lru_cache
@@ -20,23 +24,46 @@ from .models import (
 
 logger = getLogger(__name__)
 
+# Article pages are served by the API host only.
+ARTICLE_HOST = "api.vistopia.com.cn"
+
 
 class Visitor:
     def __init__(self, token: Optional[str]):
         self.token = token
 
     def authorized_url(self, url: Optional[str]) -> Optional[str]:
-        """Attach the API token to a web URL.
+        """Attach the API token to an article URL.
 
         Article pages live on the same API host as the JSON endpoints.  An
         anonymous request is served a truncated article, so the token has to
-        travel with the transcript URL as well.
+        travel with the transcript URL as well.  The token is never sent to
+        another host, and the URL is rebuilt through urlsplit so a fragment
+        or an existing query cannot swallow or duplicate the credential.
         """
         if not url or not self.token:
             return url
-        separator = "&" if "?" in url else "?"
-        return "{}{}api_token={}".format(
-            url, separator, quote(str(self.token), safe="")
+
+        parts = urlsplit(url)
+        if parts.scheme != "https" or parts.hostname != ARTICLE_HOST:
+            raise ValueError(
+                "refusing to attach credentials to an unexpected article URL"
+            )
+
+        query = [
+            (key, value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key != "api_token"
+        ]
+        query.append(("api_token", str(self.token)))
+        return urlunsplit(
+            (
+                parts.scheme,
+                parts.netloc,
+                parts.path,
+                urlencode(query),
+                parts.fragment,
+            )
         )
 
     def get_api_response(self, uri: str, params: Optional[dict] = None):
@@ -132,22 +159,65 @@ class Visitor:
                 fname = show_dir / "{}.html".format(
                     sanitize_filename(article.title)
                 )
-                if not fname.exists():
-                    url = self.authorized_url(article.content_url)
-                    if not url:
-                        continue
-                    urlretrieve(url, fname)
+                if fname.exists() and not self._is_cut_transcript(fname):
+                    continue
+                self._download_transcript(article, fname)
 
-                    with open(fname) as f:
-                        content = f.read()
+    @staticmethod
+    def _is_cut_transcript(path) -> bool:
+        """Return True when a saved article is the truncated preview."""
+        try:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                return bool(re.search(r'is_cut_str\s*=\s*"1"', handle.read()))
+        except OSError:
+            return False
 
-                    content = content.replace(
-                        "/assets/article/course.css",
-                        "https://api.vistopia.com.cn/assets/article/course.css"
+    def _download_transcript(self, article, fname):
+        """Fetch one article into a temporary file, then move it into place."""
+        url = self.authorized_url(article.content_url)
+        if not url:
+            raise RuntimeError(
+                "article URL is missing for {}".format(article.title)
+            )
+
+        descriptor, temporary = tempfile.mkstemp(
+            dir=os.path.dirname(str(fname)) or ".", suffix=".part"
+        )
+        os.close(descriptor)
+        try:
+            try:
+                urlretrieve(url, temporary)
+            except Exception:
+                # Never surface the request URL: it carries the API token.
+                raise RuntimeError(
+                    "failed to download the article for {}".format(
+                        article.title
                     )
+                ) from None
 
-                    with open(fname, "w") as f:
-                        f.write(content)
+            with open(temporary, encoding="utf-8", errors="replace") as handle:
+                content = handle.read()
+
+            if re.search(r'is_cut_str\s*=\s*"1"', content):
+                raise RuntimeError(
+                    "the server returned a truncated article for {}; "
+                    "check that the token can access this show".format(
+                        article.title
+                    )
+                )
+
+            content = content.replace(
+                "/assets/article/course.css",
+                "https://api.vistopia.com.cn/assets/article/course.css"
+            )
+
+            with open(temporary, "w", encoding="utf-8") as handle:
+                handle.write(content)
+
+            os.replace(temporary, str(fname))
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     def save_transcript_with_single_file(self, id: int,
                                          episodes: Optional[set] = None,

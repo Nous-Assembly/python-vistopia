@@ -87,24 +87,213 @@ def test_search(visitor: Visitor, keyword: str, expected: tuple):
     ])
 
 
+def _article(
+    title="第一集",
+    number="1",
+    url="https://api.vistopia.com.cn/api/v1/web/article-content/abc",
+):
+    from vistopia.models import Article
+
+    return Article(
+        article_id="abc",
+        sort_number=number,
+        title=title,
+        duration_str="10:00",
+        content_url=url,
+    )
+
+
+def _catalog(title="测试节目", article=None):
+    from vistopia.models import Catalog, CatalogPart
+
+    return Catalog(
+        author="作者",
+        title=title,
+        type="charge",
+        catalog=[CatalogPart(part=[article or _article()])],
+    )
+
+
+def _article_url(visitor):
+    return visitor.authorized_url(
+        "https://api.vistopia.com.cn/api/v1/web/article-content/abc"
+    )
+
+
 def test_authorized_url_attaches_token():
     visitor = Visitor(token="token-123")
 
-    assert (
-        visitor.authorized_url("https://api.vistopia.com.cn/article/1")
-        == "https://api.vistopia.com.cn/article/1?api_token=token-123"
-    )
-    assert (
-        visitor.authorized_url("https://api.vistopia.com.cn/article/1?from=web")
-        == "https://api.vistopia.com.cn/article/1?from=web&api_token=token-123"
+    assert _article_url(visitor) == (
+        "https://api.vistopia.com.cn/api/v1/web/article-content/abc"
+        "?api_token=token-123"
     )
 
 
-def test_authorized_url_without_token_is_unchanged():
+def test_authorized_url_round_trips_reserved_characters():
+    from urllib.parse import parse_qs, urlsplit
+
+    token = "a&b=c d/中"
+    query = parse_qs(urlsplit(_article_url(Visitor(token=token))).query)
+
+    assert query["api_token"] == [token]
+
+
+@pytest.mark.parametrize("token", [None, ""])
+def test_authorized_url_without_token_is_unchanged(token):
+    url = "https://api.vistopia.com.cn/api/v1/web/article-content/abc"
+
+    assert Visitor(token=token).authorized_url(url) == url
+    assert Visitor(token=token).authorized_url(None) is None
+
+
+def test_authorized_url_replaces_existing_token():
+    from urllib.parse import parse_qs, urlsplit
+
+    url = "https://api.vistopia.com.cn/a?api_token=old&x=1"
+    query = parse_qs(urlsplit(Visitor("new").authorized_url(url)).query)
+
+    assert query["api_token"] == ["new"]
+    assert query["x"] == ["1"]
+
+
+def test_authorized_url_keeps_fragment_out_of_the_token():
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(_article_url(Visitor("token-123")) + "#part")
+
+    assert parts.fragment == "part"
+    assert "token-123" in parts.query
+
+
+def test_authorized_url_rejects_untrusted_host_without_leaking_token():
+    with pytest.raises(ValueError) as error:
+        Visitor("token-123").authorized_url("https://evil.example/article")
+
+    assert "token-123" not in str(error.value)
+
+
+def test_authorized_url_rejects_plain_http():
+    with pytest.raises(ValueError):
+        Visitor("token-123").authorized_url(
+            "http://api.vistopia.com.cn/article"
+        )
+
+
+def test_save_transcript_sends_token(monkeypatch, tmpdir):
+    import vistopia.visitor as visitor_module
+
+    visitor = Visitor(token="secret")
+    calls = []
+
+    def fake_retrieve(url, path):
+        calls.append(url)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write('<html>is_cut_str = "0"; body</html>')
+
+    monkeypatch.setattr(visitor, "get_catalog", lambda _id: _catalog())
+    monkeypatch.setattr(visitor_module, "urlretrieve", fake_retrieve)
+
+    cwd = os.getcwd()
+    os.chdir(tmpdir)
+    try:
+        visitor.save_transcript(1)
+    finally:
+        os.chdir(cwd)
+
+    assert calls and "api_token=secret" in calls[0]
+    assert (Path(tmpdir) / "测试节目" / "第一集.html").exists()
+
+
+def test_save_transcript_rejects_cut_article(monkeypatch, tmpdir):
+    import vistopia.visitor as visitor_module
+
+    visitor = Visitor(token="secret")
+
+    def fake_retrieve(url, path):
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write('<html>is_cut_str = "1"; preview</html>')
+
+    monkeypatch.setattr(visitor, "get_catalog", lambda _id: _catalog())
+    monkeypatch.setattr(visitor_module, "urlretrieve", fake_retrieve)
+
+    cwd = os.getcwd()
+    os.chdir(tmpdir)
+    try:
+        with pytest.raises(RuntimeError):
+            visitor.save_transcript(1)
+    finally:
+        os.chdir(cwd)
+
+    show_dir = Path(tmpdir) / "测试节目"
+    assert not (show_dir / "第一集.html").exists()
+    assert not list(show_dir.glob("*.part"))
+
+
+def test_save_transcript_refetches_existing_cut_file(monkeypatch, tmpdir):
+    import vistopia.visitor as visitor_module
+
+    visitor = Visitor(token="secret")
+    show_dir = Path(tmpdir) / "测试节目"
+    show_dir.mkdir()
+    (show_dir / "第一集.html").write_text(
+        '<html>is_cut_str = "1"; preview</html>', encoding="utf-8"
+    )
+    calls = []
+
+    def fake_retrieve(url, path):
+        calls.append(url)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write('<html>is_cut_str = "0"; body</html>')
+
+    monkeypatch.setattr(visitor, "get_catalog", lambda _id: _catalog())
+    monkeypatch.setattr(visitor_module, "urlretrieve", fake_retrieve)
+
+    cwd = os.getcwd()
+    os.chdir(tmpdir)
+    try:
+        visitor.save_transcript(1)
+    finally:
+        os.chdir(cwd)
+
+    content = (show_dir / "第一集.html").read_text(encoding="utf-8")
+    assert calls
+    assert 'is_cut_str = "0"' in content
+
+
+def test_save_transcript_skips_complete_file(monkeypatch, tmpdir):
+    import vistopia.visitor as visitor_module
+
+    visitor = Visitor(token="secret")
+    show_dir = Path(tmpdir) / "测试节目"
+    show_dir.mkdir()
+    (show_dir / "第一集.html").write_text(
+        '<html>is_cut_str = "0"; body</html>', encoding="utf-8"
+    )
+
+    def fake_retrieve(url, path):
+        raise AssertionError("should not download again")
+
+    monkeypatch.setattr(visitor, "get_catalog", lambda _id: _catalog())
+    monkeypatch.setattr(visitor_module, "urlretrieve", fake_retrieve)
+
+    cwd = os.getcwd()
+    os.chdir(tmpdir)
+    try:
+        visitor.save_transcript(1)
+    finally:
+        os.chdir(cwd)
+
+
+def test_save_transcript_reports_missing_url(monkeypatch, tmpdir):
     visitor = Visitor(token=None)
-
-    assert (
-        visitor.authorized_url("https://api.vistopia.com.cn/article/1")
-        == "https://api.vistopia.com.cn/article/1"
+    monkeypatch.setattr(
+        visitor, "get_catalog", lambda _id: _catalog(article=_article(url=None))
     )
-    assert visitor.authorized_url(None) is None
+
+    cwd = os.getcwd()
+    os.chdir(tmpdir)
+    try:
+        with pytest.raises(RuntimeError):
+            visitor.save_transcript(1)
+    finally:
+        os.chdir(cwd)
